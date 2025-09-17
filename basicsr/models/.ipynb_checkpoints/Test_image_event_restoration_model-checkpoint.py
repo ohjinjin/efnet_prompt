@@ -13,16 +13,17 @@ loss_module = importlib.import_module('basicsr.models.losses')
 metric_module = importlib.import_module('basicsr.metrics')
 
 
-class ImageEventRestorationModel(BaseModel):
-    """Base Event-based deblur model for single image deblur."""
+class TestImageEventRestorationModel(BaseModel):
+    """Base Deblur model for single image deblur."""
 
     def __init__(self, opt):
-        super(ImageEventRestorationModel, self).__init__(opt)
+        super(TestImageEventRestorationModel, self).__init__(opt)
 
         # define network
         self.net_g = define_network(deepcopy(opt['network_g']))
         self.net_g = self.model_to_device(self.net_g)
         self.print_network(self.net_g)
+
 
         # load pretrained models
         load_path = self.opt['path'].get('pretrain_network_g', None)
@@ -39,8 +40,8 @@ class ImageEventRestorationModel(BaseModel):
 
         # define losses
         if train_opt.get('pixel_opt'):
+
             self.pixel_type = train_opt['pixel_opt'].pop('type')
-            # print('LOSS: pixel_type:{}'.format(self.pixel_type))
             cri_pix_cls = getattr(loss_module, self.pixel_type)
 
             self.cri_pix = cri_pix_cls(**train_opt['pixel_opt']).to(
@@ -84,25 +85,41 @@ class ImageEventRestorationModel(BaseModel):
         if optim_type == 'Adam':
             self.optimizer_g = torch.optim.Adam([{'params': optim_params}, {'params': optim_params_lowlr, 'lr': train_opt['optim_g']['lr'] * ratio}],
                                                 **train_opt['optim_g'])
-        elif optim_type == 'AdamW':
-            self.optimizer_g = torch.optim.AdamW([{'params': optim_params}, {'params': optim_params_lowlr, 'lr': train_opt['optim_g']['lr'] * ratio}],
-                                                **train_opt['optim_g'])
-
+        # elif optim_type == 'SGD':
+        #     self.optimizer_g = torch.optim.SGD(optim_params,
+        #                                        **train_opt['optim_g'])
         else:
             raise NotImplementedError(
                 f'optimizer {optim_type} is not supperted yet.')
         self.optimizers.append(self.optimizer_g)
+        # print(self.optimizer_g)
+        # exit(0)
 
     def feed_data(self, data):
 
         self.lq = data['frame'].to(self.device)
-        self.voxel=data['voxel'].to(self.device) 
+        self.voxel=data['voxel'].to(self.device)
+        self.seq_name = data ['seq'] # add seq name
+        if self.opt['dataset_name'] == 'REBlur':
+            # 260->256 if REBlur
+            self.lq = self.lq[:,:,:256,:]
+            self.voxel = self.voxel[:,:,:256,:]
+
+        # list -> str
+        self.seq_name = self.seq_name[0]
+
         if 'mask' in data:
             self.mask = data['mask'].to(self.device)
+            if self.opt['dataset_name'] == 'REBlur':
+            # 260->256 if REBlur
+                self.mask = self.mask[:,:,:256,:]
+
         if 'frame_gt' in data:
             self.gt = data['frame_gt'].to(self.device)
-        if 'image_name' in data:
-            self.image_name = data['image_name']
+            if self.opt['dataset_name'] == 'REBlur':
+            # 260->256 if REBlur
+                self.gt = self.gt[:,:,:256,:]
+
 
     def transpose(self, t, trans_idx):
         # print('transpose jt .. ', t.size())
@@ -131,6 +148,7 @@ class ImageEventRestorationModel(BaseModel):
         import math
         step_j = crop_size if num_col == 1 else math.ceil((w - crop_size) / (num_col - 1) - 1e-8)
         step_i = crop_size if num_row == 1 else math.ceil((h - crop_size) / (num_row - 1) - 1e-8)
+
 
         # print('step_i, stepj', step_i, step_j)
         # exit(0)
@@ -261,12 +279,15 @@ class ImageEventRestorationModel(BaseModel):
         self.lq = self.origin_lq
         self.voxel = self.origin_voxel
 
-
     def optimize_parameters(self, current_iter):
         self.optimizer_g.zero_grad()
-
+        # preds = self.net_g(self.lq)
         if self.opt['datasets']['train'].get('use_mask'):
+            # print('NETWORK TRAIN USE MASK')
+            # print('MASK.SHAPE:{}'.format(self.mask.shape))
+            # print('MASK:{}'.format(self.mask))
             preds = self.net_g(x = self.lq, event = self.voxel, mask = self.mask)
+
         else:
             preds = self.net_g(x = self.lq, event = self.voxel)
 
@@ -291,11 +312,8 @@ class ImageEventRestorationModel(BaseModel):
             elif self.pixel_type == 'PSNRLoss':
                 for pred in preds:
                     l_pix += self.cri_pix(pred, self.gt)
-            
-            else:
-                for pred in preds:
-                    l_pix += self.cri_pix(pred, self.gt)             
 
+            # print('l pix ... ', l_pix)
             l_total += l_pix
             loss_dict['l_pix'] = l_pix
         # perceptual loss
@@ -318,6 +336,8 @@ class ImageEventRestorationModel(BaseModel):
         if use_grad_clip:
             torch.nn.utils.clip_grad_norm_(self.net_g.parameters(), 0.01)
         self.optimizer_g.step()
+
+
         self.log_dict = self.reduce_loss_dict(loss_dict)
 
     def test(self):
@@ -332,11 +352,12 @@ class ImageEventRestorationModel(BaseModel):
                 if j >= n:
                     j = n
 
-                if self.opt['datasets']['val'].get('use_mask'):
+                if self.opt['datasets']['test'].get('use_mask', False):
                     pred = self.net_g(x = self.lq[i:j, :, :, :], event = self.voxel[i:j, :, :, :], mask = self.mask[i:j, :, :, :])  # mini batch all in 
+
                 else:
                     pred = self.net_g(x = self.lq[i:j, :, :, :], event = self.voxel[i:j, :, :, :])  # mini batch all in 
-            
+
                 if isinstance(pred, list):
                     pred = pred[-1]
                 outs.append(pred)
@@ -347,6 +368,7 @@ class ImageEventRestorationModel(BaseModel):
 
     def single_image_inference(self, img, voxel, save_path):
         self.feed_data(data={'frame': img.unsqueeze(dim=0), 'voxel': voxel.unsqueeze(dim=0)})
+
         if self.opt['val'].get('grids') is not None:
             self.grids()
             self.grids_voxel()
@@ -355,7 +377,6 @@ class ImageEventRestorationModel(BaseModel):
 
         if self.opt['val'].get('grids') is not None:
             self.grids_inverse()
-            # self.grids_inverse_voxel()
 
         visuals = self.get_current_visuals()
         sr_img = tensor2img([visuals['result']])
@@ -372,7 +393,7 @@ class ImageEventRestorationModel(BaseModel):
 
     def nondist_validation(self, dataloader, current_iter, tb_logger,
                            save_img, rgb2bgr, use_image):
-        dataset_name = self.opt.get('name') # !
+        dataset_name = self.opt.get('name')
         
         with_metrics = self.opt['val'].get('metrics') is not None
         if with_metrics:
@@ -383,13 +404,22 @@ class ImageEventRestorationModel(BaseModel):
         pbar = tqdm(total=len(dataloader), unit='image')
 
         cnt = 0
+        last_seq_name = 'Lei Sun in Zurich'
+        seq_inner_cnt = 0
 
         for idx, val_data in enumerate(dataloader):
-            if hasattr(self, 'image_name'):
-                image_name = self.image_name
-            else:
-                image_name = '{:08d}'.format(cnt)
+
             self.feed_data(val_data)
+
+            if self.seq_name == last_seq_name:
+                seq_inner_cnt += 1
+                img_name = '{:04d}'.format(seq_inner_cnt)
+                
+            else:
+                seq_inner_cnt = 0
+                img_name = '{:04d}'.format(seq_inner_cnt)
+                last_seq_name = self.seq_name
+
             if self.opt['val'].get('grids') is not None:
                 self.grids()
                 self.grids_voxel()
@@ -398,6 +428,7 @@ class ImageEventRestorationModel(BaseModel):
 
             if self.opt['val'].get('grids') is not None:
                 self.grids_inverse()
+
 
             visuals = self.get_current_visuals()
             sr_img = tensor2img([visuals['result']], rgb2bgr=rgb2bgr)
@@ -412,28 +443,30 @@ class ImageEventRestorationModel(BaseModel):
 
             if save_img:
                 
-                if self.opt['is_train']:
+                if self.opt['is_train']:  # TRAIN
                     if cnt == 1: # visualize cnt=1 image every time
-                        save_img_path = osp.join(self.opt['path']['visualization'],
-                                                image_name,
-                                                f'{image_name}_{current_iter}.png')
+                        save_img_path = osp.join(self.opt['path']['visualization'], self.seq_name,
+                                                img_name,
+                                                f'{img_name}_{current_iter}.png')
                         
-                        save_gt_img_path = osp.join(self.opt['path']['visualization'],
-                                                image_name,
-                                                f'{image_name}_{current_iter}_gt.png')
-                else:
+                        save_gt_img_path = osp.join(self.opt['path']['visualization'], self.seq_name,
+                                                img_name,
+                                                f'{img_name}_{current_iter}_gt.png')
+                            
+                else:  # TEST
                     print('Save path:{}'.format(self.opt['path']['visualization']))
                     print('Dataset name:{}'.format(dataset_name))
-                    print('Img_name:{}'.format(image_name))
+                    print('Img_name:{}'.format(img_name))
                     save_img_path = osp.join(
-                        self.opt['path']['visualization'], dataset_name,
-                        f'{image_name}.png')
+                        self.opt['path']['visualization'], dataset_name, self.seq_name,
+                        f'{img_name}.png')
                     save_gt_img_path = osp.join(
-                        self.opt['path']['visualization'], dataset_name,
-                        f'{image_name}_gt.png')
+                        self.opt['path']['visualization'], dataset_name, self.seq_name,
+                        f'{img_name}_gt.png')
                     
                 imwrite(sr_img, save_img_path)
-                imwrite(gt_img, save_gt_img_path)
+                if 'gt' in visuals:
+                    imwrite(gt_img, save_gt_img_path)
 
             if with_metrics:
                 # calculate metrics
@@ -450,8 +483,10 @@ class ImageEventRestorationModel(BaseModel):
                             metric_module, metric_type)(visuals['result'], visuals['gt'], **opt_)
 
             pbar.update(1)
-            pbar.set_description(f'Test {image_name}')
+            pbar.set_description(f'Test {img_name}')
             cnt += 1
+            # if cnt == 300:
+            #     break
         pbar.close()
 
         current_metric = 0.

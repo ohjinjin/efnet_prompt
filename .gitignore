@@ -1,5 +1,12 @@
 __pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Jupyter notebook checkpoint
+.ipynb_checkpoints/
 .vscode/
 .eggs/
 basicsr.egg-info/
 experiments/
+tb_logger/
