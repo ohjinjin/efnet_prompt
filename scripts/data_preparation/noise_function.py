@@ -1,4 +1,5 @@
-
+import torch
+import random
 def put_hot_pixels_in_voxel_(voxel, hot_pixel_range=20, hot_pixel_fraction=0.00002):
     num_hot_pixels = int(hot_pixel_fraction * voxel.shape[-1] * voxel.shape[-2])
     x = torch.randint(0, voxel.shape[-1], (num_hot_pixels,))

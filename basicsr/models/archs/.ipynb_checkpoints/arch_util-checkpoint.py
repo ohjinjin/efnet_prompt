@@ -346,6 +346,34 @@ class EventImage_ChannelAttentionTransformerBlock(nn.Module):
 
         return fused
 
+##########################################################################
+## Prompt guided module
+class PromptGuided_ChannelAttentionTransformerBlock(nn.Module):
+    def __init__(self, dim, num_heads, ffn_expansion_factor=2, bias=False, LayerNorm_type='WithBias'):
+        super(PromptGuided_ChannelAttentionTransformerBlock, self).__init__()
+
+        self.norm1_image_prompt = LayerNorm(dim, LayerNorm_type)
+        self.norm1_event = LayerNorm(dim, LayerNorm_type)
+        self.attn = Mutual_Attention(dim, num_heads, bias)
+        # mlp
+        self.norm2 = nn.LayerNorm(dim)
+        mlp_hidden_dim = int(dim * ffn_expansion_factor)
+        self.ffn = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=nn.GELU, drop=0.)
+
+    def forward(self, image_prompt, event):
+        # image_edge: b, c, h, w
+        # event: b, c, h, w
+        # return: b, c, h, w
+        assert image_prompt.shape == event.shape, 'the shape of image_prompt doesnt equal to event'
+        b, c , h, w = image_prompt.shape
+        fused = image_prompt + self.attn(self.norm1_image_prompt(image_prompt), self.norm1_event(event)) # b, c, h, w
+
+        # mlp
+        fused = to_3d(fused) # b, h*w, c
+        fused = fused + self.ffn(self.norm2(fused))
+        fused = to_4d(fused, h, w)
+
+        return fused
 
 
 class Mlp(nn.Module):
@@ -415,6 +443,55 @@ class Mutual_Attention_prompt(nn.Module):
         return out
 
 ##########################################################################
+## customed attention_sum->mul
+##########################################################################
+class Mutual_Attention_prompt2(nn.Module):
+    def __init__(self, dim, num_heads, bias):
+        super(Mutual_Attention_prompt2, self).__init__()
+        self.num_heads = num_heads
+        self.temperature = nn.Parameter(torch.ones(num_heads, 1, 1))
+
+        self.q = nn.Conv2d(dim, dim, kernel_size=1, bias=bias)
+        self.k = nn.Conv2d(dim, dim, kernel_size=1, bias=bias)
+        self.v = nn.Conv2d(dim, dim, kernel_size=1, bias=bias)
+
+        self.project_out = nn.Conv2d(dim, dim, kernel_size=1, bias=bias)
+        
+
+    def forward(self, x, y, prompt_local, prompt_global):
+
+        assert x.shape == y.shape, 'The shape of feature maps from image and event branch are not equal!'
+
+        b,c,h,w = x.shape
+#         print("check :::::::::::::::c", b,c,h,w)
+#         print("check2 :::::::::::::::prompt", prompt_local.shape)
+
+        q = self.q(x) # image
+        k = self.k(y) # event
+        v = self.v(y) # event
+        
+        q = rearrange(q, 'b (head c) h w -> b head c (h w)', head=self.num_heads)
+        k = rearrange(k, 'b (head c) h w -> b head c (h w)', head=self.num_heads)
+        v = rearrange(v, 'b (head c) h w -> b head c (h w)', head=self.num_heads)
+        prompt_l = rearrange(prompt_local, 'b (head c) h w -> b head c (h w)', head=self.num_heads)
+        prompt_g = rearrange(prompt_global, 'b (head c) h w -> b head c (h w)', head=self.num_heads)
+#         print("CHECK PROMTPLL111::::", prompt.shape)
+#         prompt = prompt.repeat(1, 1, 1, self.num_heads)
+#         print("CHECK PROMTPLL::::", prompt.shape)
+#         print("CHECK VVVVV::::", v.shape)
+        v = (v + prompt_g) * prompt_l
+
+        q = torch.nn.functional.normalize(q, dim=-1)
+        k = torch.nn.functional.normalize(k, dim=-1)
+
+        attn = (q @ k.transpose(-2, -1)) * self.temperature
+        attn = attn.softmax(dim=-1)
+        out = (attn @ v)
+        out = rearrange(out, 'b head c (h w) -> b (head c) h w', head=self.num_heads, h=h, w=w)
+        out = self.project_out(out)
+        return out
+
+##########################################################################
 ## customed Event-Image Channel Attention (EICA) using prompt
 class EventImage_w_prompt_ChannelAttentionTransformerBlock(nn.Module):
     def __init__(self, dim, num_heads, ffn_expansion_factor=2, bias=False, LayerNorm_type='WithBias'):
@@ -445,7 +522,66 @@ class EventImage_w_prompt_ChannelAttentionTransformerBlock(nn.Module):
 
         return fused
 
+##########################################################################
+## customed Edge-aware Sharpening module with prompt
+class EdgeAwareSharpening_w_prompt_ChannelAttentionTransformerBlock(nn.Module):
+    def __init__(self, dim, num_heads, ffn_expansion_factor=2, bias=False, LayerNorm_type='WithBias'):
+        super(EdgeAwareSharpening_w_prompt_ChannelAttentionTransformerBlock, self).__init__()
 
+        self.norm1_image_edge = LayerNorm(dim, LayerNorm_type)
+        self.norm1_event = LayerNorm(dim, LayerNorm_type)
+        self.attn = Mutual_Attention_prompt(dim, num_heads, bias)
+        # mlp
+        self.norm2 = nn.LayerNorm(dim)
+        mlp_hidden_dim = int(dim * ffn_expansion_factor)
+        self.ffn = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=nn.GELU, drop=0.)
+
+    def forward(self, image_edge, event, prompt_local):
+        # image_edge: b, c, h, w
+        # event: b, c, h, w
+        # return: b, c, h, w
+        assert image_edge.shape == event.shape, 'the shape of image_edge doesnt equal to event'
+        b, c , h, w = image_edge.shape
+        
+        prompt_feature = prompt_local
+        fused = image_edge + self.attn(self.norm1_image_edge(image_edge), self.norm1_event(event), prompt_feature) # b, c, h, w
+
+        # mlp
+        fused = to_3d(fused) # b, h*w, c
+        fused = fused + self.ffn(self.norm2(fused))
+        fused = to_4d(fused, h, w)
+
+        return fused
+
+##########################################################################
+## Edge-aware Sharpening module
+class EdgeAwareSharpening_ChannelAttentionTransformerBlock(nn.Module):
+    def __init__(self, dim, num_heads, ffn_expansion_factor=2, bias=False, LayerNorm_type='WithBias'):
+        super(EdgeAwareSharpening_ChannelAttentionTransformerBlock, self).__init__()
+
+        self.norm1_image_edge = LayerNorm(dim, LayerNorm_type)
+        self.norm1_event = LayerNorm(dim, LayerNorm_type)
+        self.attn = Mutual_Attention(dim, num_heads, bias)
+        # mlp
+        self.norm2 = nn.LayerNorm(dim)
+        mlp_hidden_dim = int(dim * ffn_expansion_factor)
+        self.ffn = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=nn.GELU, drop=0.)
+
+    def forward(self, image_edge, event):
+        # image_edge: b, c, h, w
+        # event: b, c, h, w
+        # return: b, c, h, w
+        assert image_edge.shape == event.shape, 'the shape of image_edge doesnt equal to event'
+        b, c , h, w = image_edge.shape
+        fused = image_edge + self.attn(self.norm1_image_edge(image_edge), self.norm1_event(event)) # b, c, h, w
+
+        # mlp
+        fused = to_3d(fused) # b, h*w, c
+        fused = fused + self.ffn(self.norm2(fused))
+        fused = to_4d(fused, h, w)
+
+        return fused
+    
 ##########################################################################
 ## customed Event-Image Channel Attention (EICA) using prompt
 class EventImage_w_promptLG_ChannelAttentionTransformerBlock(nn.Module):
@@ -477,6 +613,38 @@ class EventImage_w_promptLG_ChannelAttentionTransformerBlock(nn.Module):
 
         return fused
 
+##########################################################################
+## customed Event-Image Channel Attention (EICA) using prompt_reverse operation
+class EventImage_w_promptLG_reverse_ChannelAttentionTransformerBlock(nn.Module):
+    def __init__(self, dim, num_heads, ffn_expansion_factor=2, bias=False, LayerNorm_type='WithBias'):
+        super(EventImage_w_promptLG_reverse_ChannelAttentionTransformerBlock, self).__init__()
+
+        self.norm1_image = LayerNorm(dim, LayerNorm_type)
+        self.norm1_event = LayerNorm(dim, LayerNorm_type)
+        self.attn = Mutual_Attention_prompt2(dim, num_heads, bias)
+        # mlp
+        self.norm2 = nn.LayerNorm(dim)
+        mlp_hidden_dim = int(dim * ffn_expansion_factor)
+        self.ffn = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=nn.GELU, drop=0.)
+
+    def forward(self, image, event, prompt_local, prompt_global):
+        # image: b, c, h, w
+        # event: b, c, h, w
+        # return: b, c, h, w
+        assert image.shape == event.shape, 'the shape of image doesnt equal to event'
+        b, c , h, w = image.shape
+
+        fused = image + self.attn(self.norm1_image(image), self.norm1_event(event), prompt_local, prompt_global) # b, c, h, w
+
+        # mlp
+        fused = to_3d(fused) # b, h*w, c
+        fused = fused + self.ffn(self.norm2(fused))
+        fused = to_4d(fused, h, w)
+
+        return fused
+
+
+
 ################################
 #  Prompt local
 ################################
@@ -493,8 +661,19 @@ class PromptMapGenBlock(nn.Module):
         B, C, H, W = x.shape
 #         print("CHECK JINJIN::::::x", x.shape)  # CHECK JINJIN::::::x torch.Size([4, 2, 256, 256])
 
-        x_flatten = x.permute(0, 2, 3, 1).reshape(B*H*W, -1)        
-        prompt_feature = torch.matmul(x_flatten, self.prompt_param)
+        # x_flatten = torch.randn(
+        #     x.permute(0, 2, 3, 1).reshape(B*H*W, -1).shape,
+        #     device=x.device,
+        #     dtype=x.dtype
+        # )#x.permute(0, 2, 3, 1).reshape(B*H*W, -1)
+        x_flatten = x.permute(0, 2, 3, 1).reshape(B*H*W, -1)
+        # prompt_param = torch.randn(
+        #     self.prompt_param.shape,
+        #     device=x.device,
+        #     dtype=x.dtype
+        # )#self.prompt_param
+        prompt_param = self.prompt_param
+        prompt_feature = torch.matmul(x_flatten, prompt_param)
 #         if input_colorname == None:
 # #             seg_map = self.SegNet(x)
 #             seg_map_ = seg_map.permute(0, 2, 3, 1).reshape(B*H*W, -1)        
@@ -512,6 +691,167 @@ class PromptMapGenBlock(nn.Module):
         # # print(prompt_feature_.mean())
 
         return prompt_feature_#, seg_map
+
+
+
+################################
+#  Prompt local init방법 다양하게..
+################################
+class PromptMapGenBlock_diverse_init(nn.Module):
+    # prompt_len=5, in_ch=128, prompt_dim=128
+    def __init__(self, prompt_len=32, in_ch=128, prompt_dim=128, stride=1, init_mode='xavier_uniform', column_gain=None, signed_gain=False, seed=None):
+        super(PromptMapGenBlock_diverse_init,self).__init__()
+#         self.SegNet = SegmentationNet(lin_dim_=in_ch, prompt_len_=prompt_len)
+        self.prompt_param = nn.Parameter(torch.empty(prompt_len, prompt_dim))
+        self.conv3x3 = nn.Conv2d(prompt_dim, in_ch, kernel_size=3, stride=stride, padding=1, bias=False)
+        self.reset_parameters(init_mode=init_mode, column_gain=column_gain, signed_gain=signed_gain, seed=seed)
+
+    
+    @torch.no_grad()
+    def reset_parameters(self, init_mode='xavier_uniform', column_gain=None, signed_gain=False, seed=None):
+        if seed is not None:
+            torch.manual_seed(seed)
+
+        W = self.prompt_param              # (in_ch, prompt_dim)
+        fin, fout = self.in_ch, self.prompt_dim
+
+        # 1) 기본 대칭 분포 초기화들 (음수 포함)
+        if init_mode == 'xavier_uniform':
+            nn.init.xavier_uniform_(W, gain=1.0)               # U[-a, a]
+        elif init_mode == 'xavier_normal':
+            nn.init.xavier_normal_(W, gain=1.0)                # N(0, σ^2)
+        elif init_mode == 'kaiming_uniform':
+            nn.init.kaiming_uniform_(W, a=math.sqrt(5), mode='fan_in', nonlinearity='linear')  # U[-a,a]
+        elif init_mode == 'kaiming_normal':
+            nn.init.kaiming_normal_(W, a=math.sqrt(5), mode='fan_in', nonlinearity='linear')   # N(0, σ^2)
+        elif init_mode == 'orthogonal':
+            nn.init.orthogonal_(W, gain=1.0)                   # 직교; 요소는 ± 섞임
+        elif init_mode == 'spherical':
+            W.normal_(0, 1); W /= (W.norm(dim=0, keepdim=True) + 1e-12)   # 각 컬럼 L2=1, ± 섞임
+        elif init_mode == 'normal':
+            std = math.sqrt(2.0 / (fin + fout))
+            W.normal_(0.0, std)                                # N(0, σ^2)
+        elif init_mode == 'uniform_sym':
+            bound = 1.0 / math.sqrt(fin)
+            W.uniform_(-bound, bound)                          # U[-b, b]
+        # 2) 다양성 실험용 분포들 (음수 포함)
+        elif init_mode == 'rademacher':
+            # 각 요소가 P(±1)=0.5인 Rademacher * 스케일
+            W.bernoulli_(0.5); W.mul_(2).sub_(1.0)             # ±1
+            W.mul_(1.0 / math.sqrt(fin))                       # fan-in 기준 스케일
+        elif init_mode == 'laplace':
+            # 라플라스(쌍곡선) 분포: 뾰족하고 꼬리가 김 → 희소성/강한 다양성
+            dist = torch.distributions.Laplace(loc=0.0, scale=1.0 / math.sqrt(fin))
+            W.copy_(dist.sample(W.shape))
+        elif init_mode == 'gauss_mix':
+            # 가우시안 두 개의 혼합(더 다양한 모드)
+            W1 = torch.empty_like(W).normal_(0.0, 1.0 / math.sqrt(fin))
+            W2 = torch.empty_like(W).normal_(0.0, 2.0 / math.sqrt(fin))    # 더 큰 분산
+            mask = torch.empty_like(W).bernoulli_(0.3)                      # 30%는 큰 분산
+            W.copy_(mask * W2 + (1 - mask) * W1)
+        elif init_mode == 'zeros':
+            W.zero_()                                         # 음수는 아님(0), 실험용
+        else:
+            raise ValueError(f"unknown init_mode: {init_mode}")
+
+        # 3) 컬럼별 스케일 다양화 (로그-균등) + (옵션) 부호 랜덤
+        if column_gain is not None:
+            gmin, gmax = column_gain
+            assert gmin > 0 and gmax > gmin
+            log_g = torch.empty(1, self.prompt_dim, device=W.device).uniform_(math.log(gmin), math.log(gmax))
+            gains = log_g.exp()  # (1, prompt_dim) > 0
+            if signed_gain:
+                # Rademacher(±1)를 곱해 컬럼별로 부호까지 뒤섞기
+                signs = torch.empty(1, self.prompt_dim, device=W.device).bernoulli_(0.5).mul_(2).sub_(1.0)
+                gains = gains * signs
+            W.mul_(gains)   # 컬럼별 스케일/부호 적용
+
+
+    def forward(self,x):
+        
+        B, C, H, W = x.shape
+#         print("CHECK JINJIN::::::x", x.shape)  # CHECK JINJIN::::::x torch.Size([4, 2, 256, 256])
+
+        # x_flatten = torch.randn(
+        #     x.permute(0, 2, 3, 1).reshape(B*H*W, -1).shape,
+        #     device=x.device,
+        #     dtype=x.dtype
+        # )#x.permute(0, 2, 3, 1).reshape(B*H*W, -1)
+        x_flatten = x.permute(0, 2, 3, 1).reshape(B*H*W, -1)
+        # prompt_param = torch.randn(
+        #     self.prompt_param.shape,
+        #     device=x.device,
+        #     dtype=x.dtype
+        # )#self.prompt_param
+        prompt_param = self.prompt_param
+        prompt_feature = torch.matmul(x_flatten, prompt_param)
+#         if input_colorname == None:
+# #             seg_map = self.SegNet(x)
+#             seg_map_ = seg_map.permute(0, 2, 3, 1).reshape(B*H*W, -1)        
+#             prompt_feature = torch.matmul(seg_map_, self.prompt_param)
+#         else:
+#             seg_map = F.interpolate(input_colorname, (H,W), mode='bilinear').to(x.device) #.cuda()
+#             seg_map_ = seg_map.permute(0, 2, 3, 1).reshape(B*H*W, -1)        
+#             prompt_feature = torch.matmul(seg_map_, self.prompt_param)
+        
+        prompt_feature_ = prompt_feature.reshape(B, H, W, -1).permute(0, 3, 1, 2)
+        prompt_feature_ = self.conv3x3(prompt_feature_)
+
+        # if H == 64:
+        #     save_image(prompt_feature_.squeeze(0).unsqueeze(1), 'pred2.png')
+        # # print(prompt_feature_.mean())
+
+        return prompt_feature_#, seg_map
+
+
+################################
+#  Prompt local with offset of dcn
+################################
+class PromptMapGenBlockDCN(nn.Module):
+    # prompt_len=5, in_ch=128, prompt_dim=128
+    def __init__(self, prompt_len=32, in_ch=128, prompt_dim=128, stride=1):
+        super(PromptMapGenBlockDCN,self).__init__()
+#         self.SegNet = SegmentationNet(lin_dim_=in_ch, prompt_len_=prompt_len)
+        self.prompt_param = nn.Parameter(torch.rand(prompt_len, prompt_dim))
+        self.conv3x3 = nn.Conv2d(prompt_dim, in_ch, kernel_size=3, stride=stride, padding=1, bias=False)
+        self.offset = nn.Conv2d(in_ch, 18, kernel_size=3, padding=1, bias=True)
+
+    def forward(self,x):
+        
+        B, C, H, W = x.shape
+#         print("CHECK JINJIN::::::x", x.shape)  # CHECK JINJIN::::::x torch.Size([4, 2, 256, 256])
+
+        # x_flatten = torch.randn(
+        #     x.permute(0, 2, 3, 1).reshape(B*H*W, -1).shape,
+        #     device=x.device,
+        #     dtype=x.dtype
+        # )#x.permute(0, 2, 3, 1).reshape(B*H*W, -1)
+        x_flatten = x.permute(0, 2, 3, 1).reshape(B*H*W, -1)
+        # prompt_param = torch.randn(
+        #     self.prompt_param.shape,
+        #     device=x.device,
+        #     dtype=x.dtype
+        # )#self.prompt_param
+        prompt_param = self.prompt_param
+        prompt_feature = torch.matmul(x_flatten, prompt_param)
+#         if input_colorname == None:
+# #             seg_map = self.SegNet(x)
+#             seg_map_ = seg_map.permute(0, 2, 3, 1).reshape(B*H*W, -1)        
+#             prompt_feature = torch.matmul(seg_map_, self.prompt_param)
+#         else:
+#             seg_map = F.interpolate(input_colorname, (H,W), mode='bilinear').to(x.device) #.cuda()
+#             seg_map_ = seg_map.permute(0, 2, 3, 1).reshape(B*H*W, -1)        
+#             prompt_feature = torch.matmul(seg_map_, self.prompt_param)
+        
+        prompt_feature_ = prompt_feature.reshape(B, H, W, -1).permute(0, 3, 1, 2)
+        prompt_feature_ = self.conv3x3(prompt_feature_)
+        offset = self.offset(prompt_feature_)
+
+        # if H == 64:
+        #     save_image(prompt_feature_.squeeze(0).unsqueeze(1), 'pred2.png')
+        # # print(prompt_feature_.mean())
+
+        return prompt_feature_, offset#, seg_map
 
 ################################
 #  Prompt global

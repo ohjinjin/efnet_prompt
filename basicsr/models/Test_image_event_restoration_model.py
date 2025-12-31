@@ -454,9 +454,9 @@ class TestImageEventRestorationModel(BaseModel):
                                                 f'{img_name}_{current_iter}_gt.png')
                             
                 else:  # TEST
-                    print('Save path:{}'.format(self.opt['path']['visualization']))
-                    print('Dataset name:{}'.format(dataset_name))
-                    print('Img_name:{}'.format(img_name))
+                    # print('Save path:{}'.format(self.opt['path']['visualization']))
+                    # print('Dataset name:{}'.format(dataset_name))
+                    # print('Img_name:{}'.format(img_name))
                     save_img_path = osp.join(
                         self.opt['path']['visualization'], dataset_name, self.seq_name,
                         f'{img_name}.png')
@@ -497,6 +497,13 @@ class TestImageEventRestorationModel(BaseModel):
 
             self._log_validation_metric_values(current_iter, dataset_name,
                                                tb_logger)
+            print(f"[Val] dataset={dataset_name} iter={current_iter} (avg over {cnt} samples)")
+            for k, v in self.metric_results.items():
+                try:
+                    print(f"  - {k}: {float(v):.6f}")
+                except Exception:
+                    print(f"  - {k}: {v}")
+
         return current_metric
 
 

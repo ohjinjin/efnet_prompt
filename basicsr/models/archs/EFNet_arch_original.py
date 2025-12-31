@@ -45,7 +45,7 @@ class SAM(nn.Module):
         return x1, img
 
 class EFNet(nn.Module):
-    def __init__(self, in_chn=3, ev_chn=48, wf=64, depth=3, fuse_before_downsample=True, relu_slope=0.2, num_heads=[1,2,4]):
+    def __init__(self, in_chn=3, ev_chn=6, wf=64, depth=3, fuse_before_downsample=True, relu_slope=0.2, num_heads=[1,2,4]):
         super(EFNet, self).__init__()
         self.depth = depth
         self.fuse_before_downsample = fuse_before_downsample
@@ -87,7 +87,12 @@ class EFNet(nn.Module):
 
     def forward(self, x, event, mask=None):
         image = x
-        event = torch.cat((event[:, :24, :, :], event[:, 25:, :, :]), dim=1)
+        weights = torch.tensor([0.33, 0.5, 1.0, 1.0, 0.5, 0.33], device=x.device, dtype=x.dtype)
+
+        # (1,C,1,1) 형태로 reshape 후 곱하기 → 브로드캐스트 적용
+        event = event * weights.view(1, -1, 1, 1)
+
+        # event = torch.cat((event[:, :24, :, :], event[:, 25:, :, :]), dim=1)
 
         ev = []
         #EVencoder

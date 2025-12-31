@@ -11,10 +11,45 @@ EFNet
 import torch
 import torch.nn as nn
 import math
-from basicsr.models.archs.arch_util import EventImage_w_prompt_ChannelAttentionTransformerBlock, PromptMapGenBlock
+from basicsr.models.archs.arch_util import EventImage_ChannelAttentionTransformerBlock, PromptGuided_ChannelAttentionTransformerBlock, PromptMapGenBlock, PromptMapGenBlock1D
 from torch.nn import functional as F
 from PIL import Image
 import os
+
+def scer_to_voxel_general(event: torch.Tensor) -> torch.Tensor:
+    """
+    SCER (B, C, H, W) -> voxel-like (B, C, H, W)
+    규칙(채널 수 C에 대해 일반화):
+      - 가운데 두 채널 [mid_left, mid_right]는 그대로 복사
+      - 그보다 왼쪽 채널 i (< mid_left):  edge[i] = event[i] - event[i+1]   # forward diff
+      - 그보다 오른쪽 채널 i (> mid_right): edge[i] = event[i] - event[i-1] # backward diff
+
+    예) C=6이면 mid_left=2, mid_right=3 이므로
+        edge[0]=e[0]-e[1], edge[1]=e[1]-e[2], edge[2]=e[2], edge[3]=e[3],
+        edge[4]=e[4]-e[3], edge[5]=e[5]-e[4]
+    """
+    assert event.dim() == 4, "event must be (B, C, H, W)"
+    B, C, H, W = event.shape
+    assert C >= 2, "C must be >= 2"
+
+    # 가운데 두 채널 인덱스
+    mid_left  = C // 2 - 1
+    mid_right = C // 2
+
+    edge = torch.zeros_like(event)
+
+    # 왼쪽 구간: i in [0, mid_left-1]  -> forward diff
+    if mid_left > 0:
+        edge[:, :mid_left] = event[:, :mid_left] - event[:, 1:mid_left+1]
+
+    # 가운데 두 채널: 그대로 복사
+    edge[:, mid_left:mid_right+1] = event[:, mid_left:mid_right+1]
+
+    # 오른쪽 구간: i in [mid_right+1, C-1] -> backward diff
+    if mid_right + 1 < C:
+        edge[:, mid_right+1:] = event[:, mid_right+1:] - event[:, mid_right:-1]
+
+    return edge
 
 def conv3x3(in_chn, out_chn, bias=True):
     layer = nn.Conv2d(in_chn, out_chn, kernel_size=3, stride=1, padding=1, bias=bias)
@@ -84,14 +119,157 @@ class PixelwisePromptDist(nn.Module):
         # softmax → 픽셀별 채널 분포
         logits = logits - logits.max(dim=1, keepdim=True).values
         probs = F.softmax(logits, dim=1)  # (B, P, H, W)
+        # probs = logits
 
         return probs
+
+# import torch
+# import torch.nn as nn
+# import torch.nn.functional as F
+from torchvision.models import resnet18, ResNet18_Weights, resnet50, ResNet50_Weights
+
+class ResNet50PromptDist(nn.Module):
+    """
+    해상도 보존형 ResNet-50: 다운샘플링만 막은 버전
+    입력: (B, C_in, H, W)  출력: (B, prompt_num, H, W)
+    """
+    def __init__(self, in_channels: int, prompt_num: int,
+                 pretrained: bool = False, temperature: float = 1.0):
+        super().__init__()
+        self.temperature = temperature
+
+        # 1. pretrained ResNet-50 모델 로드
+        m = resnet50(weights=ResNet50_Weights.IMAGENET1K_V1 if pretrained else None)
+
+        # 2. Stem 수정: conv1 stride=1, maxpool 제거하여 초기 다운샘플링 방지
+        old_conv1 = m.conv1
+        m.conv1 = nn.Conv2d(in_channels, 64, kernel_size=7, stride=1, padding=3, bias=False)
+        if pretrained:
+            with torch.no_grad():
+                w = old_conv1.weight  # (64, 3, 7, 7)
+                if in_channels == 3:
+                    m.conv1.weight.copy_(w)
+                else:
+                    # 입력 채널이 3이 아닐 경우, 기존 가중치의 평균을 내어 확장
+                    w_mean = w.mean(dim=1, keepdim=True)  # (64, 1, 7, 7)
+                    m.conv1.weight.copy_(w_mean.expand(-1, in_channels, -1, -1))
+        m.maxpool = nn.Identity()
+
+        # 3. Layer 2, 3, 4의 다운샘플링 방지
+        # ResNet-50의 Bottleneck 블록은 conv2에서 다운샘플링이 일어납니다.
+        def _no_downsample(layer: nn.Sequential):
+            b0 = layer[0]  # 각 layer의 첫 번째 블록
+            
+            # Bottleneck 블록의 stride는 conv2에 있으므로 conv2의 stride를 1로 변경
+            if hasattr(b0, "conv2"):
+                b0.conv2.stride = (1, 1)
+                
+            # 채널 매칭용 downsample conv가 있으면 stride도 1로 변경
+            if getattr(b0, "downsample", None) is not None:
+                ds0 = b0.downsample[0]
+                if isinstance(ds0, nn.Conv2d):
+                    ds0.stride = (1, 1)
+
+        _no_downsample(m.layer2)
+        _no_downsample(m.layer3)
+        _no_downsample(m.layer4)
+
+        # 4. 백본(FC 레이어 제외) 정의
+        self.stem = nn.Sequential(m.conv1, m.bn1, m.relu, m.maxpool)  # (B, 64, H, W)
+        self.layer1 = m.layer1  # (B, 256, H, W)
+        self.layer2 = m.layer2  # (B, 512, H, W)
+        self.layer3 = m.layer3  # (B, 1024, H, W)
+        self.layer4 = m.layer4  # (B, 2048, H, W)
+
+        # 5. Head 정의: 픽셀별 로짓을 prompt_num 채널로 매핑
+        # ResNet-50의 최종 출력 채널은 2048입니다.
+        self.head = nn.Conv2d(2048, prompt_num, kernel_size=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Backbone
+        x = self.stem(x)
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        x = self.layer4(x)      # (B, 2048, H, W) 해상도 유지
+
+        # Head
+        logits = self.head(x)   # (B, P, H, W)
+
+        # Temperature-scaled stable softmax (픽셀별 softmax)
+        logits = logits / max(self.temperature, 1e-6)
+        logits = logits - logits.max(dim=1, keepdim=True).values # for numerical stability
+        return F.softmax(logits, dim=1)
+
+class ResNet18PromptDist(nn.Module):
+    """
+    해상도 보존형 ResNet18: 다운샘플만 막은 최소 수정 버전
+    입력: (B, C_in, H, W)  출력: (B, prompt_num, H, W)
+    """
+    def __init__(self, in_channels: int, prompt_num: int,
+                 pretrained: bool = False, temperature: float = 1.0):
+        super().__init__()
+        self.temperature = temperature
+
+        m = resnet18(weights=ResNet18_Weights.IMAGENET1K_V1 if pretrained else None)
+
+        # 1) stem: conv1 stride=1, maxpool 제거
+        old_conv1 = m.conv1
+        m.conv1 = nn.Conv2d(in_channels, 64, kernel_size=7, stride=1, padding=3, bias=False)
+        if pretrained:
+            with torch.no_grad():
+                w = old_conv1.weight  # (64,3,7,7)
+                if in_channels == 3:
+                    m.conv1.weight.copy_(w)
+                else:
+                    w_mean = w.mean(dim=1, keepdim=True)  # (64,1,7,7)
+                    m.conv1.weight.copy_(w_mean.expand(-1, in_channels, -1, -1))
+        m.maxpool = nn.Identity()
+
+        # 2) layer2/3/4의 첫 블록 stride=1로 덮어쓰기 (다운샘플 방지)
+        def _no_downsample(layer: nn.Sequential):
+            b0 = layer[0]
+            # 기본블록의 stride는 conv1에 들어가므로 conv1만 1로
+            if hasattr(b0, "conv1"):
+                b0.conv1.stride = (1, 1)
+            # 채널 매칭용 downsample conv가 있으면 stride도 1로
+            if getattr(b0, "downsample", None) is not None:
+                ds0 = b0.downsample[0]
+                if isinstance(ds0, nn.Conv2d):
+                    ds0.stride = (1, 1)
+
+        _no_downsample(m.layer2)
+        _no_downsample(m.layer3)
+        _no_downsample(m.layer4)
+
+        # 백본(FC 제거)
+        self.stem   = nn.Sequential(m.conv1, m.bn1, m.relu, m.maxpool)  # (B,64,H,W)
+        self.layer1 = m.layer1  # (B,64,H,W)
+        self.layer2 = m.layer2  # (B,128,H,W)
+        self.layer3 = m.layer3  # (B,256,H,W)
+        self.layer4 = m.layer4  # (B,512,H,W)
+
+        # 픽셀별 로짓 → prompt_num채널
+        self.head = nn.Conv2d(512, prompt_num, kernel_size=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.stem(x)
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        x = self.layer4(x)            # (B,512,H,W) 해상도 유지
+        logits = self.head(x)         # (B,P,H,W)
+        # 픽셀별 softmax
+        logits = logits / max(self.temperature, 1e-6)
+        logits = logits - logits.max(dim=1, keepdim=True).values
+        return F.softmax(logits, dim=1)
+
 
 class EFNet(nn.Module):
     def __init__(self, in_chn=3, ev_chn=6, wf=64, depth=3, fuse_before_downsample=True, relu_slope=0.2, num_heads=[1,2,4]):
         super(EFNet, self).__init__()
-        self.prompt_num=8
-        self.prompt_weight = PixelwisePromptDist(in_channels=ev_chn+in_chn, prompt_num=self.prompt_num, relu_slope=relu_slope)
+        self.prompt_num = 6
+        # self.prompt_weight = PixelwisePromptDist(in_channels=ev_chn+in_chn, prompt_num=self.prompt_num, relu_slope=relu_slope)
         
         self.depth = depth
         self.fuse_before_downsample = fuse_before_downsample
@@ -133,32 +311,7 @@ class EFNet(nn.Module):
 
     def forward(self, x, event, mask=None):
         image = x
-
-        # B, C, H, W = event.shape
-        prompt_weight_map = self.prompt_weight(torch.cat([event, image], dim=1))
-#         B, N, H, W = prompt_weight_map.shape
-# #         print("CHEKKKKBBBBCCCCCCCCNNNNNHHHHWWWWWWWW::",prompt_weights.shape)
-# #         print("CHEKKKKBBBBCCCCCCCCNNNNNHHHHWWWWWWWW::",prompt_weights[0,:,0].shape)
-
-#         counter = 0
-#         # 디렉토리가 존재하는 경우 연번호 추가
-#         while os.path.exists(f"/home/work/data/code/EFNet_original/EFNet/experiments/result_weight_nhwc_dilation/{counter}"):
-# #             dir_path = os.path.join(base_path, f"{each_batch}_{counter}")
-#             counter += 1
-            
-#         # 각 배치에 대해 이미지로 저장
-#         for each_batch in range(B):
-#             # 폴더 생성
-#             os.makedirs(f"/home/work/data/code/EFNet_original/EFNet/experiments/result_weight_nhwc_dilation/{counter}/{each_batch}/", exist_ok=True)
-#             print(f"WEIGHTMAP::: /home/work/data/code/EFNet_original/EFNet/experiments/result_weight_nhwc_dilation/{counter}/{each_batch}/")
-#             # 텐서를 PIL 이미지로 변환
-#             imgs = prompt_weight_map[each_batch].cpu().numpy()  # (N, H, W)
-#             for _ in range(N):
-#                 img = imgs[_]
-# #                 print("CHECKJJINJIN:::::::", img.shape)
-#                 img = (img * 255).astype('uint8')  # 그레이스케일 값 범위를 0-255로 조정
-#                 img = Image.fromarray(img)
-#                 img.save(f"/home/work/data/code/EFNet_original/EFNet/experiments/result_weight_nhwc_dilation/{counter}/{each_batch}/prompt_weight_{_}.png")
+        edge = scer_to_voxel_general(event)
 
         ev = []
         #EVencoder
@@ -179,17 +332,23 @@ class EFNet(nn.Module):
         encs = []
         decs = []
         masks = []
+        ######################
+        # counter = 0
+        # while os.path.exists(f"/home/work/data/code/EFNet_original/EFNet/experiments/result_weight_nhwc_dilation_prompt6_softmax/{counter}"):
+        #     counter += 1
+        ######################
+        counter = None
         for i, down in enumerate(self.down_path_1):
             if (i+1) < self.depth:
 
-                x1, x1_up = down(x1, prompt_weight_map, event_filter=ev[i], merge_before_downsample=self.fuse_before_downsample)
+                x1, x1_up = down(x1, event_filter=ev[i], edge=edge, merge_before_downsample=self.fuse_before_downsample)
                 encs.append(x1_up)
 
                 if mask is not None:
                     masks.append(F.interpolate(mask, scale_factor = 0.5**i))
             
             else:
-                x1 = down(x1, prompt_weight_map, event_filter=ev[i], merge_before_downsample=self.fuse_before_downsample)
+                x1 = down(x1, event_filter=ev[i], edge=edge, merge_before_downsample=self.fuse_before_downsample, prompt=True)
 
 
         for i, up in enumerate(self.up_path_1):
@@ -239,6 +398,7 @@ class UNetConvBlock(nn.Module):
         self.identity = nn.Conv2d(in_size, out_size, 1, 1, 0)
         self.use_emgc = use_emgc
         self.num_heads = num_heads
+        self.stride_promptweight = stride_promptweight
 
         self.conv_1 = nn.Conv2d(in_size, out_size, kernel_size=3, padding=1, bias=True)
         self.relu_1 = nn.LeakyReLU(relu_slope, inplace=False)
@@ -253,16 +413,22 @@ class UNetConvBlock(nn.Module):
 
         if downsample:
             self.downsample = conv_down(out_size, out_size, bias=False)
+            self.image_event_transformer = EventImage_ChannelAttentionTransformerBlock(out_size, num_heads=self.num_heads, ffn_expansion_factor=4, bias=False, LayerNorm_type='WithBias')
 
         if self.num_heads is not None:
-            self.downsample_prompt = conv_down(out_size, out_size, bias=False)
-            self.image_event_transformer = EventImage_w_prompt_ChannelAttentionTransformerBlock(out_size, num_heads=self.num_heads, ffn_expansion_factor=4, bias=False, LayerNorm_type='WithBias')
-            self.prompt_localblock = PromptMapGenBlock(prompt_len=self.prompt_num, in_ch=out_size, prompt_dim=out_size, stride=stride_promptweight)
-        
-
-    def forward(self, x, prompt_weight_map=None, enc=None, dec=None, mask=None, event_filter=None, merge_before_downsample=True):
+            self.conv_edge = nn.Conv2d(6, out_size, kernel_size=3, padding=1, stride=stride_promptweight, bias=True)
+            self.downsample_edge = conv_down(out_size, out_size, bias=False)
+            self.conv1d = nn.Conv2d(out_size * 3, out_size, kernel_size=1)
+            if not downsample:
+                self.image_event_prompt_transformer = PromptGuided_ChannelAttentionTransformerBlock(out_size, num_heads=self.num_heads, ffn_expansion_factor=4, bias=False, LayerNorm_type='WithBias')
+                self.prompt_weight = ResNet18PromptDist(in_channels=out_size, prompt_num=self.prompt_num, pretrained=False, temperature=1.0)
+                self.prompt_localblock = PromptMapGenBlock(prompt_len=self.prompt_num, in_ch=out_size, prompt_dim=out_size, stride=1)
+                self.prompt_globalblock = PromptMapGenBlock1D(prompt_len=self.prompt_num, in_ch=out_size, prompt_dim=out_size)
+            
+             
+    def forward(self, x, edge=None, enc=None, dec=None, mask=None, event_filter=None, merge_before_downsample=True, prompt=None):
         out = self.conv_1(x)
-
+        
         out_conv1 = self.relu_1(out)
         out_conv2 = self.relu_2(self.conv_2(out_conv1))
 
@@ -273,25 +439,33 @@ class UNetConvBlock(nn.Module):
             out_enc = self.emgc_enc(enc) + self.emgc_enc_mask((1-mask)*enc)
             out_dec = self.emgc_dec(dec) + self.emgc_dec_mask(mask*dec)
             out = out + out_enc + out_dec        
-            
+        
         if event_filter is not None and merge_before_downsample:
             # b, c, h, w = out.shape
-            prompt_local = self.prompt_localblock(prompt_weight_map)
-            out = self.image_event_transformer(out, event_filter, prompt_local) 
+            out = self.image_event_transformer(out, event_filter)
+            
              
-        if self.downsample:
-            out_down = self.downsample(out)
+        if self.downsample: # 1,2 layer면 true
+            out_down = self.downsample(out) # cross attn 한걸 downsampling
             if not merge_before_downsample: 
-                out_prompt_down = self.downsample_prompt(prompt_local)
-                out_down = self.image_event_transformer(out_down, event_filter, out_prompt_down) 
+                out_down = self.image_event_transformer(out_down, event_filter) 
 
             return out_down, out
 
-        else:
+        else: # bottleneck
             if merge_before_downsample:
+                out_edge = self.conv_edge(edge)
+                prompt_weight_map = self.prompt_weight(out_edge)
+                prompt_weight_map_global = prompt_weight_map.mean(dim=[2,3])
+
+                prompt_local = self.prompt_localblock(prompt_weight_map)
+                prompt_global = self.prompt_globalblock(prompt_weight_map_global, prompt_local.shape[2], prompt_local.shape[3])
+
+                out = self.image_event_prompt_transformer(self.conv1d(torch.cat([out, prompt_local, prompt_global], 1)), event_filter)
                 return out
             else:
-                out = self.image_event_transformer(out, event_filter, prompt_local)
+                out_down = self.image_event_transformer(out_down, event_filter)
+                
 
 
 class UNetEVConvBlock(nn.Module):

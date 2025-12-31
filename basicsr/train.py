@@ -14,7 +14,7 @@ sys.path.insert(0, '/home/work/data/code/EFNet_original/EFNet/')
 from basicsr.data import create_dataloader, create_dataset
 from basicsr.data.data_sampler import EnlargedSampler
 from basicsr.data.prefetch_dataloader import CPUPrefetcher, CUDAPrefetcher
-from basicsr.models import create_model
+# from basicsr.models import create_model
 from basicsr.utils import (MessageLogger, check_resume, get_env_info,
                            get_root_logger, get_time_str, init_tb_logger,
                            init_wandb_logger, make_exp_dirs, mkdir_and_rename,
@@ -133,6 +133,8 @@ def create_train_val_dataloader(opt, logger):
 
 
 def main():
+    from basicsr.models import create_model
+
     # parse options, set distributed setting, set ramdom seed
     opt = parse_options(is_train=True)
 

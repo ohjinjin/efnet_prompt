@@ -2,8 +2,8 @@
 import numpy as np
 import cv2
 import os
-from .raw_event_dataset import *
-from .noise_function import add_noise_to_voxel, put_hot_pixels_in_voxel_
+from scripts.data_preparation.raw_event_dataset import *
+from scripts.data_preparation.noise_function import add_noise_to_voxel, put_hot_pixels_in_voxel_
 import argparse
 import h5py
 import torch
@@ -15,13 +15,13 @@ parser.add_argument("--input_path", default="/scratch/leisun/REBlur_h5", help="P
 parser.add_argument("--save_path", default="/scratch/leisun/REBlur_SCER")
 
 parser.add_argument("--voxel_method", default="SCER_real_data", help="SCER_esim, SCER_real_data, SBT, All_accumulate=SBT + bin=1")
-parser.add_argument("--add_noise", default=False, help="add noisy to voxel like hot pixel")
+parser.add_argument("--add_noise", default=True, help="add noisy to voxel like hot pixel")
 
 has_exposure_time = True  # false if esim, true if our seems data
 exposure_time = 1/240
-num_bins = 6
+num_bins = 8
 num_pixels = 1280*720
-has_gt_frame = False
+has_gt_frame = True
 
 args = parser.parse_args()
 

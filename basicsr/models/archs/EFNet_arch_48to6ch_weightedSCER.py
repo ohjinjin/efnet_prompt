@@ -27,6 +27,69 @@ def conv(in_channels, out_channels, kernel_size, bias=False, stride = 1):
         in_channels, out_channels, kernel_size,
         padding=(kernel_size//2), bias=bias, stride = stride)
 
+def scer_to_voxel_general(event: torch.Tensor) -> torch.Tensor:
+    """
+    SCER (B, C, H, W) -> voxel-like (B, C, H, W)
+    규칙(채널 수 C에 대해 일반화):
+      - 가운데 두 채널 [mid_left, mid_right]는 그대로 복사
+      - 그보다 왼쪽 채널 i (< mid_left):  edge[i] = event[i] - event[i+1]   # forward diff
+      - 그보다 오른쪽 채널 i (> mid_right): edge[i] = event[i] - event[i-1] # backward diff
+
+    예) C=6이면 mid_left=2, mid_right=3 이므로
+        edge[0]=e[0]-e[1], edge[1]=e[1]-e[2], edge[2]=e[2], edge[3]=e[3],
+        edge[4]=e[4]-e[3], edge[5]=e[5]-e[4]
+    """
+    assert event.dim() == 4, "event must be (B, C, H, W)"
+    B, C, H, W = event.shape
+    assert C >= 2, "C must be >= 2"
+
+    # 가운데 두 채널 인덱스
+    mid_left  = C // 2 - 1
+    mid_right = C // 2
+
+    edge = torch.zeros_like(event)
+
+    # 왼쪽 구간: i in [0, mid_left-1]  -> forward diff
+    if mid_left > 0:
+        edge[:, :mid_left] = event[:, :mid_left] - event[:, 1:mid_left+1]
+
+    # 가운데 두 채널: 그대로 복사
+    edge[:, mid_left:mid_right+1] = event[:, mid_left:mid_right+1]
+
+    # 오른쪽 구간: i in [mid_right+1, C-1] -> backward diff
+    if mid_right + 1 < C:
+        edge[:, mid_right+1:] = event[:, mid_right+1:] - event[:, mid_right:-1]
+
+    return edge
+
+
+class DynamicChannelMixer(nn.Module):
+    def __init__(self, in_ch=6, hidden=32, out_ch=6, norm='softmax'):
+        super().__init__()
+        # context를 뽑는 간단한 헤드 (원하면 더 깊게 가능)
+        self.ctx = nn.Sequential(
+            nn.Conv2d(in_ch, hidden, 3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden, out_ch*in_ch, 1)  # (B, 36, H, W)
+        )
+        self.out_ch = out_ch
+        self.norm = norm
+
+    def forward(self, x):               # x: (B, 6, H, W)
+        B, C, H, W = x.shape            # C=6
+        w = self.ctx(x)                 # (B, 36, H, W)
+        w = w.view(B, self.out_ch, C, H, W)       # (B, out=6, in=6, H, W)
+
+        if self.norm == 'softmax':
+            w = F.softmax(w, dim=2)     # 각 out행이 확률 분포가 되게(in축 정규화)
+        elif self.norm == 'sigmoid':
+            w = torch.sigmoid(w)
+        # else: 그대로 사용(자유 가중치)
+
+        # einsum으로 O[b,o,h,w] = sum_i w[b,o,i,h,w] * x[b,i,h,w]
+        out = torch.einsum('boihw, bihw -> bohw', w, x)
+        return out                      # (B, 6, H, W)
+
 ## Supervised Attention Module
 ## https://github.com/swz30/MPRNet
 class SAM(nn.Module):
@@ -45,7 +108,7 @@ class SAM(nn.Module):
         return x1, img
 
 class EFNet(nn.Module):
-    def __init__(self, in_chn=3, ev_chn=48, wf=64, depth=3, fuse_before_downsample=True, relu_slope=0.2, num_heads=[1,2,4]):
+    def __init__(self, in_chn=3, ev_chn=6, wf=64, depth=3, fuse_before_downsample=True, relu_slope=0.2, num_heads=[1,2,4]):
         super(EFNet, self).__init__()
         self.depth = depth
         self.fuse_before_downsample = fuse_before_downsample
@@ -57,6 +120,7 @@ class EFNet(nn.Module):
         # event
         self.down_path_ev = nn.ModuleList()
         self.conv_ev1 = nn.Conv2d(ev_chn, wf, 3, 1, 1)
+        self.dynamic_scer = DynamicChannelMixer(48, 32, 6)
 
         prev_channels = self.get_input_chn(wf)
         for i in range(depth):
@@ -87,7 +151,12 @@ class EFNet(nn.Module):
 
     def forward(self, x, event, mask=None):
         image = x
-        event = torch.cat((event[:, :24, :, :], event[:, 25:, :, :]), dim=1)
+        event_48 = torch.cat((event[:, :24, :, :], event[:, 25:, :, :]), dim=1)
+        event_voxel_48 = scer_to_voxel_general(event_48)
+        # event = torch.cat([event_48[:,0,:,:].unsqueeze(1), event_48[:,8,:,:].unsqueeze(1), event_48[:,16,:,:].unsqueeze(1),  event_48[:,31,:,:].unsqueeze(1), event_48[:,39,:,:].unsqueeze(1), event_48[:,47,:,:].unsqueeze(1)], dim=1)
+        event = self.dynamic_scer(event_voxel_48)
+        del(event_48)
+        del(event_voxel_48)
 
         ev = []
         #EVencoder

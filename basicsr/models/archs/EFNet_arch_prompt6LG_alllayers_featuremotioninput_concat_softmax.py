@@ -11,7 +11,7 @@ EFNet
 import torch
 import torch.nn as nn
 import math
-from basicsr.models.archs.arch_util import EventImage_w_prompt_ChannelAttentionTransformerBlock, PromptMapGenBlock
+from basicsr.models.archs.arch_util import PromptGuided_ChannelAttentionTransformerBlock, PromptMapGenBlock, PromptMapGenBlock1D
 from torch.nn import functional as F
 from PIL import Image
 import os
@@ -84,14 +84,85 @@ class PixelwisePromptDist(nn.Module):
         # softmax → 픽셀별 채널 분포
         logits = logits - logits.max(dim=1, keepdim=True).values
         probs = F.softmax(logits, dim=1)  # (B, P, H, W)
+        # probs = logits
 
         return probs
+
+# import torch
+# import torch.nn as nn
+# import torch.nn.functional as F
+from torchvision.models import resnet18, ResNet18_Weights
+
+
+class ResNet18PromptDist(nn.Module):
+    """
+    해상도 보존형 ResNet18: 다운샘플만 막은 최소 수정 버전
+    입력: (B, C_in, H, W)  출력: (B, prompt_num, H, W)
+    """
+    def __init__(self, in_channels: int, prompt_num: int,
+                 pretrained: bool = False, temperature: float = 1.0):
+        super().__init__()
+        self.temperature = temperature
+
+        m = resnet18(weights=ResNet18_Weights.IMAGENET1K_V1 if pretrained else None)
+
+        # 1) stem: conv1 stride=1, maxpool 제거
+        old_conv1 = m.conv1
+        m.conv1 = nn.Conv2d(in_channels, 64, kernel_size=7, stride=1, padding=3, bias=False)
+        if pretrained:
+            with torch.no_grad():
+                w = old_conv1.weight  # (64,3,7,7)
+                if in_channels == 3:
+                    m.conv1.weight.copy_(w)
+                else:
+                    w_mean = w.mean(dim=1, keepdim=True)  # (64,1,7,7)
+                    m.conv1.weight.copy_(w_mean.expand(-1, in_channels, -1, -1))
+        m.maxpool = nn.Identity()
+
+        # 2) layer2/3/4의 첫 블록 stride=1로 덮어쓰기 (다운샘플 방지)
+        def _no_downsample(layer: nn.Sequential):
+            b0 = layer[0]
+            # 기본블록의 stride는 conv1에 들어가므로 conv1만 1로
+            if hasattr(b0, "conv1"):
+                b0.conv1.stride = (1, 1)
+            # 채널 매칭용 downsample conv가 있으면 stride도 1로
+            if getattr(b0, "downsample", None) is not None:
+                ds0 = b0.downsample[0]
+                if isinstance(ds0, nn.Conv2d):
+                    ds0.stride = (1, 1)
+
+        _no_downsample(m.layer2)
+        _no_downsample(m.layer3)
+        _no_downsample(m.layer4)
+
+        # 백본(FC 제거)
+        self.stem   = nn.Sequential(m.conv1, m.bn1, m.relu, m.maxpool)  # (B,64,H,W)
+        self.layer1 = m.layer1  # (B,64,H,W)
+        self.layer2 = m.layer2  # (B,128,H,W)
+        self.layer3 = m.layer3  # (B,256,H,W)
+        self.layer4 = m.layer4  # (B,512,H,W)
+
+        # 픽셀별 로짓 → prompt_num채널
+        self.head = nn.Conv2d(512, prompt_num, kernel_size=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.stem(x)
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        x = self.layer4(x)            # (B,512,H,W) 해상도 유지
+        logits = self.head(x)         # (B,P,H,W)
+        # 픽셀별 softmax
+        logits = logits / max(self.temperature, 1e-6)
+        logits = logits - logits.max(dim=1, keepdim=True).values
+        return F.softmax(logits, dim=1)
+
 
 class EFNet(nn.Module):
     def __init__(self, in_chn=3, ev_chn=6, wf=64, depth=3, fuse_before_downsample=True, relu_slope=0.2, num_heads=[1,2,4]):
         super(EFNet, self).__init__()
-        self.prompt_num=8
-        self.prompt_weight = PixelwisePromptDist(in_channels=ev_chn+in_chn, prompt_num=self.prompt_num, relu_slope=relu_slope)
+        self.prompt_num = 6
+        # self.prompt_weight = PixelwisePromptDist(in_channels=ev_chn+in_chn, prompt_num=self.prompt_num, relu_slope=relu_slope)
         
         self.depth = depth
         self.fuse_before_downsample = fuse_before_downsample
@@ -133,9 +204,9 @@ class EFNet(nn.Module):
 
     def forward(self, x, event, mask=None):
         image = x
-
+        motion = torch.cat([event[:,0,:,:].unsqueeze(1), event[:,-1,:,:].unsqueeze(1)], dim=1)
         # B, C, H, W = event.shape
-        prompt_weight_map = self.prompt_weight(torch.cat([event, image], dim=1))
+        # prompt_weight_map = self.prompt_weight(torch.cat([event, image], dim=1))
 #         B, N, H, W = prompt_weight_map.shape
 # #         print("CHEKKKKBBBBCCCCCCCCNNNNNHHHHWWWWWWWW::",prompt_weights.shape)
 # #         print("CHEKKKKBBBBCCCCCCCCNNNNNHHHHWWWWWWWW::",prompt_weights[0,:,0].shape)
@@ -145,7 +216,7 @@ class EFNet(nn.Module):
 #         while os.path.exists(f"/home/work/data/code/EFNet_original/EFNet/experiments/result_weight_nhwc_dilation/{counter}"):
 # #             dir_path = os.path.join(base_path, f"{each_batch}_{counter}")
 #             counter += 1
-            
+
 #         # 각 배치에 대해 이미지로 저장
 #         for each_batch in range(B):
 #             # 폴더 생성
@@ -179,17 +250,23 @@ class EFNet(nn.Module):
         encs = []
         decs = []
         masks = []
+        ######################
+        counter = 0
+        while os.path.exists(f"/home/work/data/code/EFNet_original/EFNet/experiments/result_weight_prompt6_softmax_featuremotioninput_resnet18/{counter}"):
+            counter += 1
+        ######################
+        # counter = None
         for i, down in enumerate(self.down_path_1):
             if (i+1) < self.depth:
 
-                x1, x1_up = down(x1, prompt_weight_map, event_filter=ev[i], merge_before_downsample=self.fuse_before_downsample)
+                x1, x1_up = down(x1, event_filter=ev[i], motion=motion, merge_before_downsample=self.fuse_before_downsample, counter=counter)
                 encs.append(x1_up)
 
                 if mask is not None:
                     masks.append(F.interpolate(mask, scale_factor = 0.5**i))
             
             else:
-                x1 = down(x1, prompt_weight_map, event_filter=ev[i], merge_before_downsample=self.fuse_before_downsample)
+                x1 = down(x1, event_filter=ev[i], motion=motion, merge_before_downsample=self.fuse_before_downsample, counter=counter)
 
 
         for i, up in enumerate(self.up_path_1):
@@ -239,6 +316,7 @@ class UNetConvBlock(nn.Module):
         self.identity = nn.Conv2d(in_size, out_size, 1, 1, 0)
         self.use_emgc = use_emgc
         self.num_heads = num_heads
+        self.stride_promptweight = stride_promptweight
 
         self.conv_1 = nn.Conv2d(in_size, out_size, kernel_size=3, padding=1, bias=True)
         self.relu_1 = nn.LeakyReLU(relu_slope, inplace=False)
@@ -255,14 +333,20 @@ class UNetConvBlock(nn.Module):
             self.downsample = conv_down(out_size, out_size, bias=False)
 
         if self.num_heads is not None:
-            self.downsample_prompt = conv_down(out_size, out_size, bias=False)
-            self.image_event_transformer = EventImage_w_prompt_ChannelAttentionTransformerBlock(out_size, num_heads=self.num_heads, ffn_expansion_factor=4, bias=False, LayerNorm_type='WithBias')
-            self.prompt_localblock = PromptMapGenBlock(prompt_len=self.prompt_num, in_ch=out_size, prompt_dim=out_size, stride=stride_promptweight)
+            # self.downsample_prompt = conv_down(out_size, out_size, bias=False)
+            self.conv_motion = nn.Conv2d(2, out_size, kernel_size=3, padding=1, stride=stride_promptweight, bias=True)
+            self.downsample_motion = conv_down(out_size, out_size, bias=False)
+            self.conv1d = nn.Conv2d(out_size * 3, out_size, kernel_size=1)
+            self.image_event_transformer = PromptGuided_ChannelAttentionTransformerBlock(out_size, num_heads=self.num_heads, ffn_expansion_factor=4, bias=False, LayerNorm_type='WithBias')
+            # self.prompt_weight = PixelwisePromptDist(in_channels=3*out_size, prompt_num=self.prompt_num, relu_slope=relu_slope)
+            self.prompt_weight = ResNet18PromptDist(in_channels=3*out_size, prompt_num=self.prompt_num, pretrained=False, temperature=1.0)
+            self.prompt_localblock = PromptMapGenBlock(prompt_len=self.prompt_num, in_ch=out_size, prompt_dim=out_size, stride=1)#stride_promptweight)
+            self.prompt_globalblock = PromptMapGenBlock1D(prompt_len=self.prompt_num, in_ch=out_size, prompt_dim=out_size)
         
 
-    def forward(self, x, prompt_weight_map=None, enc=None, dec=None, mask=None, event_filter=None, merge_before_downsample=True):
+    def forward(self, x, motion=None, enc=None, dec=None, mask=None, event_filter=None, merge_before_downsample=True, counter=0):
         out = self.conv_1(x)
-
+        
         out_conv1 = self.relu_1(out)
         out_conv2 = self.relu_2(self.conv_2(out_conv1))
 
@@ -276,14 +360,67 @@ class UNetConvBlock(nn.Module):
             
         if event_filter is not None and merge_before_downsample:
             # b, c, h, w = out.shape
+            out_motion = self.conv_motion(motion)
+            prompt_weight_map = self.prompt_weight(torch.cat([out, event_filter, out_motion], dim=1))
+            prompt_weight_map_global = prompt_weight_map.mean(dim=[2,3])
+            # print(":::::::::::prompt_weight_map.shape", prompt_weight_map.shape)
+            ######################
+            B, N, H, W = prompt_weight_map.shape
+#         print("CHEKKKKBBBBCCCCCCCCNNNNNHHHHWWWWWWWW::",prompt_weights.shape)
+#         print("CHEKKKKBBBBCCCCCCCCNNNNNHHHHWWWWWWWW::",prompt_weights[0,:,0].shape)
+
+            # 각 배치에 대해 이미지로 저장
+            for each_level in range(3):
+                # 폴더 생성
+                if self.stride_promptweight==(2**each_level):
+                    os.makedirs(f"/home/work/data/code/EFNet_original/EFNet/experiments/result_weight_prompt6_softmax_featuremotioninput_resnet18/{counter}/{each_level}/", exist_ok=True)
+                    print(f"WEIGHTMAP::: /home/work/data/code/EFNet_original/EFNet/experiments/result_weight_prompt6_softmax_featuremotioninput_resnet18/{counter}/{each_level}/")
+                    # 텐서를 PIL 이미지로 변환
+                    imgs = prompt_weight_map[0].cpu().numpy()  # (N, H, W)
+                    for _ in range(N):
+                        img = imgs[_]
+        #                 print("CHECKJJINJIN:::::::", img.shape)
+                        img = (img * 255).astype('uint8')  # 그레이스케일 값 범위를 0-255로 조정
+                        img = Image.fromarray(img)
+                        img.save(f"/home/work/data/code/EFNet_original/EFNet/experiments/result_weight_prompt6_softmax_featuremotioninput_resnet18/{counter}/{each_level}/prompt_weight_{_}.png")
+            ######################
             prompt_local = self.prompt_localblock(prompt_weight_map)
-            out = self.image_event_transformer(out, event_filter, prompt_local) 
+            prompt_global = self.prompt_globalblock(prompt_weight_map_global, prompt_local.shape[2], prompt_local.shape[3])
+            # print(":::::::::::prompt_local.shape", prompt_local.shape)
+            out = self.image_event_transformer(self.conv1d(torch.cat([out, prompt_local, prompt_global], 1)), event_filter) 
              
         if self.downsample:
             out_down = self.downsample(out)
             if not merge_before_downsample: 
-                out_prompt_down = self.downsample_prompt(prompt_local)
-                out_down = self.image_event_transformer(out_down, event_filter, out_prompt_down) 
+                out_motion_down = self.downsample_motion(out_motion)
+                prompt_weight_map_down = self.prompt_weight(torch.cat([out_down, event_filter, out_motion_down], dim=1))
+                prompt_weight_map_global_down = prompt_weight_map_down.mean(dim=[2,3])
+                ######################
+                B, N, H, W = prompt_weight_map_down.shape
+    #         print("CHEKKKKBBBBCCCCCCCCNNNNNHHHHWWWWWWWW::",prompt_weights.shape)
+    #         print("CHEKKKKBBBBCCCCCCCCNNNNNHHHHWWWWWWWW::",prompt_weights[0,:,0].shape)
+        
+                # 각 배치에 대해 이미지로 저장
+                for each_level in range(3):
+                    # 폴더 생성
+                    if self.stride_promptweight==(2**each_level):
+                        os.makedirs(f"/home/work/data/code/EFNet_original/EFNet/experiments/result_weight_prompt6_softmax_featuremotioninput_resnet18/{counter}/{each_level}/", exist_ok=True)
+                        print(f"WEIGHTMAP::: /home/work/data/code/EFNet_original/EFNet/experiments/result_weight_prompt6_softmax_featuremotioninput_resnet18/{counter}/{each_level}/")
+                        # 텐서를 PIL 이미지로 변환
+                        imgs = prompt_weight_map_down[0].cpu().numpy()  # (N, H, W)
+                        for _ in range(N):
+                            img = imgs[_]
+            #                 print("CHECKJJINJIN:::::::", img.shape)
+                            img = (img * 255).astype('uint8')  # 그레이스케일 값 범위를 0-255로 조정
+                            img = Image.fromarray(img)
+                            img.save(f"/home/work/data/code/EFNet_original/EFNet/experiments/result_weight_prompt6_softmax_featuremotioninput_resnet18/{counter}/{each_level}/prompt_weight_{_}.png")
+                ######################
+                # print(":::::::::::prompt_weight_map_down.shape", prompt_weight_map_down.shape)
+                prompt_local_down = self.prompt_localblock(prompt_weight_map_down)
+                prompt_global_down = self.prompt_globalblock(prompt_weight_map_global_down, prompt_local_down.shape[2], prompt_local_down.shape[3])
+                # print(":::::::::::prompt_local.shape", prompt_local.shape)
+                # prompt_local_down = self.downsample_prompt(prompt_local)
+                out_down = self.image_event_transformer(self.conv1d(torch.cat([out_down, prompt_local_down, prompt_global_down], 1)), event_filter) 
 
             return out_down, out
 
@@ -291,7 +428,7 @@ class UNetConvBlock(nn.Module):
             if merge_before_downsample:
                 return out
             else:
-                out = self.image_event_transformer(out, event_filter, prompt_local)
+                out = self.image_event_transformer(self.conv1d(torch.cat([out, prompt_local, prompt_global], 1)), event_filter)
 
 
 class UNetEVConvBlock(nn.Module):

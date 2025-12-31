@@ -11,8 +11,46 @@ EFNet
 import torch
 import torch.nn as nn
 import math
-from basicsr.models.archs.arch_util import EventImage_ChannelAttentionTransformerBlock
+from basicsr.models.archs.arch_util import EdgeAwareSharpening_w_prompt_ChannelAttentionTransformerBlock, PromptMapGenBlock
 from torch.nn import functional as F
+from PIL import Image
+import os
+
+def scer_to_voxel_general(event: torch.Tensor) -> torch.Tensor:
+    """
+    SCER (B, C, H, W) -> voxel-like (B, C, H, W)
+    규칙(채널 수 C에 대해 일반화):
+      - 가운데 두 채널 [mid_left, mid_right]는 그대로 복사
+      - 그보다 왼쪽 채널 i (< mid_left):  edge[i] = event[i] - event[i+1]   # forward diff
+      - 그보다 오른쪽 채널 i (> mid_right): edge[i] = event[i] - event[i-1] # backward diff
+
+    예) C=6이면 mid_left=2, mid_right=3 이므로
+        edge[0]=e[0]-e[1], edge[1]=e[1]-e[2], edge[2]=e[2], edge[3]=e[3],
+        edge[4]=e[4]-e[3], edge[5]=e[5]-e[4]
+    """
+    assert event.dim() == 4, "event must be (B, C, H, W)"
+    B, C, H, W = event.shape
+    assert C >= 2, "C must be >= 2"
+
+    # 가운데 두 채널 인덱스
+    mid_left  = C // 2 - 1
+    mid_right = C // 2
+
+    edge = torch.zeros_like(event)
+
+    # 왼쪽 구간: i in [0, mid_left-1]  -> forward diff
+    if mid_left > 0:
+        edge[:, :mid_left] = event[:, :mid_left] - event[:, 1:mid_left+1]
+
+    # 가운데 두 채널: 그대로 복사
+    edge[:, mid_left:mid_right+1] = event[:, mid_left:mid_right+1]
+
+    # 오른쪽 구간: i in [mid_right+1, C-1] -> backward diff
+    if mid_right + 1 < C:
+        edge[:, mid_right+1:] = event[:, mid_right+1:] - event[:, mid_right:-1]
+
+    return edge
+
 
 def conv3x3(in_chn, out_chn, bias=True):
     layer = nn.Conv2d(in_chn, out_chn, kernel_size=3, stride=1, padding=1, bias=bias)
@@ -44,9 +82,53 @@ class SAM(nn.Module):
         x1 = x1+x
         return x1, img
 
+class PixelwisePromptDist(nn.Module):
+    """
+    입력:  (B, C_in, H, W)
+    출력:  (B, prompt_num, H, W)  # 픽셀별 softmax → 각 픽셀에서 채널합=1
+    """
+    def __init__(self, in_channels: int, prompt_num: int, relu_slope: float = 0.2):
+        super().__init__()
+        self.prompt_num = prompt_num
+
+        # 다운샘플 제거 → stride=1 통일
+        self.backbone = nn.Sequential(
+            nn.Conv2d(in_channels, 64, 3, 1, 1),
+            nn.BatchNorm2d(64),
+            nn.LeakyReLU(relu_slope, inplace=True),
+
+            nn.Conv2d(64, 128, 3, 1, 1),   # stride=1
+            nn.BatchNorm2d(128),
+            nn.LeakyReLU(relu_slope, inplace=True),
+
+            nn.Conv2d(128, 256, 3, 1, 1),  # stride=1
+            nn.BatchNorm2d(256),
+            nn.LeakyReLU(relu_slope, inplace=True),
+
+            nn.Conv2d(256, 512, 3, 1, 1),  # stride=1
+            nn.BatchNorm2d(512),
+            nn.LeakyReLU(relu_slope, inplace=True),
+        )
+
+        # 픽셀별 prompt_num개 로짓 생성
+        self.head = nn.Conv2d(512, prompt_num, kernel_size=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        feat = self.backbone(x)     # (B, 512, H, W)
+        logits = self.head(feat)    # (B, P, H, W)
+
+        # softmax → 픽셀별 채널 분포
+        logits = logits - logits.max(dim=1, keepdim=True).values
+        probs = F.softmax(logits, dim=1)  # (B, P, H, W)
+
+        return probs
+
 class EFNet(nn.Module):
-    def __init__(self, in_chn=3, ev_chn=48, wf=64, depth=3, fuse_before_downsample=True, relu_slope=0.2, num_heads=[1,2,4]):
+    def __init__(self, in_chn=3, ev_chn=6, wf=64, depth=3, fuse_before_downsample=True, relu_slope=0.2, num_heads=[1,2,4]):
         super(EFNet, self).__init__()
+        self.prompt_num=32
+        self.prompt_weight = PixelwisePromptDist(in_channels=ev_chn+in_chn, prompt_num=self.prompt_num, relu_slope=relu_slope)
+        
         self.depth = depth
         self.fuse_before_downsample = fuse_before_downsample
         self.num_heads = num_heads
@@ -62,8 +144,8 @@ class EFNet(nn.Module):
         for i in range(depth):
             downsample = True if (i+1) < depth else False 
 
-            self.down_path_1.append(UNetConvBlock(prev_channels, (2**i) * wf, downsample, relu_slope, num_heads=self.num_heads[i]))
-            self.down_path_2.append(UNetConvBlock(prev_channels, (2**i) * wf, downsample, relu_slope, use_emgc=downsample))
+            self.down_path_1.append(UNetConvBlock(prev_channels, (2**i) * wf, downsample, relu_slope, edge_chn=ev_chn, prompt_num=self.prompt_num, stride_promptweight=(2**i), num_heads=self.num_heads[i]))
+            self.down_path_2.append(UNetConvBlock(prev_channels, (2**i) * wf, downsample, relu_slope, edge_chn=ev_chn, use_emgc=downsample))
             # ev encoder
             if i < self.depth:
                 self.down_path_ev.append(UNetEVConvBlock(prev_channels, (2**i) * wf, downsample , relu_slope))
@@ -87,8 +169,34 @@ class EFNet(nn.Module):
 
     def forward(self, x, event, mask=None):
         image = x
-        event = torch.cat((event[:, :24, :, :], event[:, 25:, :, :]), dim=1)
 
+        # B, C, H, W = event.shape
+        prompt_weight_map = self.prompt_weight(torch.cat([event, image], dim=1))
+#         B, N, H, W = prompt_weight_map.shape
+# #         print("CHEKKKKBBBBCCCCCCCCNNNNNHHHHWWWWWWWW::",prompt_weights.shape)
+# #         print("CHEKKKKBBBBCCCCCCCCNNNNNHHHHWWWWWWWW::",prompt_weights[0,:,0].shape)
+
+#         counter = 0
+#         # 디렉토리가 존재하는 경우 연번호 추가
+#         while os.path.exists(f"/home/work/data/code/EFNet_original/EFNet/experiments/result_weight_nhwc_dilation/{counter}"):
+# #             dir_path = os.path.join(base_path, f"{each_batch}_{counter}")
+#             counter += 1
+
+#         # 각 배치에 대해 이미지로 저장
+#         for each_batch in range(B):
+#             # 폴더 생성
+#             os.makedirs(f"/home/work/data/code/EFNet_original/EFNet/experiments/result_weight_nhwc_dilation/{counter}/{each_batch}/", exist_ok=True)
+#             print(f"WEIGHTMAP::: /home/work/data/code/EFNet_original/EFNet/experiments/result_weight_nhwc_dilation/{counter}/{each_batch}/")
+#             # 텐서를 PIL 이미지로 변환
+#             imgs = prompt_weight_map[each_batch].cpu().numpy()  # (N, H, W)
+#             for _ in range(N):
+#                 img = imgs[_]
+# #                 print("CHECKJJINJIN:::::::", img.shape)
+#                 img = (img * 255).astype('uint8')  # 그레이스케일 값 범위를 0-255로 조정
+#                 img = Image.fromarray(img)
+#                 img.save(f"/home/work/data/code/EFNet_original/EFNet/experiments/result_weight_nhwc_dilation/{counter}/{each_batch}/prompt_weight_{_}.png")
+
+        edge = scer_to_voxel_general(event)#torch.cat([event[:,2,:,:].unsqueeze(1), event[:,3,:,:].unsqueeze(1)], dim=1)
         ev = []
         #EVencoder
         e1 = self.conv_ev1(event)
@@ -111,14 +219,14 @@ class EFNet(nn.Module):
         for i, down in enumerate(self.down_path_1):
             if (i+1) < self.depth:
 
-                x1, x1_up = down(x1, event_filter=ev[i], merge_before_downsample=self.fuse_before_downsample)
+                x1, x1_up = down(x1, edge, prompt_weight_map, event_filter=ev[i], merge_before_downsample=self.fuse_before_downsample)
                 encs.append(x1_up)
 
                 if mask is not None:
                     masks.append(F.interpolate(mask, scale_factor = 0.5**i))
             
             else:
-                x1 = down(x1, event_filter=ev[i], merge_before_downsample=self.fuse_before_downsample)
+                x1 = down(x1, edge, prompt_weight_map, event_filter=ev[i], merge_before_downsample=self.fuse_before_downsample)
 
 
         for i, up in enumerate(self.up_path_1):
@@ -161,8 +269,9 @@ class EFNet(nn.Module):
 
 
 class UNetConvBlock(nn.Module):
-    def __init__(self, in_size, out_size, downsample, relu_slope, use_emgc=False, num_heads=None): # cat
+    def __init__(self, in_size, out_size, downsample, relu_slope, edge_chn=2, prompt_num=None, stride_promptweight=None, use_emgc=False, num_heads=None): # cat
         super(UNetConvBlock, self).__init__()
+        self.prompt_num = prompt_num
         self.downsample = downsample
         self.identity = nn.Conv2d(in_size, out_size, 1, 1, 0)
         self.use_emgc = use_emgc
@@ -183,10 +292,15 @@ class UNetConvBlock(nn.Module):
             self.downsample = conv_down(out_size, out_size, bias=False)
 
         if self.num_heads is not None:
-            self.image_event_transformer = EventImage_ChannelAttentionTransformerBlock(out_size, num_heads=self.num_heads, ffn_expansion_factor=4, bias=False, LayerNorm_type='WithBias')
+            self.conv_edge = nn.Conv2d(edge_chn, out_size, kernel_size=3, padding=1, stride=stride_promptweight, bias=True)
+            self.downsample_edge = conv_down(out_size, out_size, bias=False)
+            self.conv1d = nn.Conv2d(out_size * 2, out_size, kernel_size=1)
+            self.downsample_prompt = conv_down(out_size, out_size, bias=False)
+            self.image_event_transformer = EdgeAwareSharpening_w_prompt_ChannelAttentionTransformerBlock(out_size, num_heads=self.num_heads, ffn_expansion_factor=4, bias=False, LayerNorm_type='WithBias')
+            self.prompt_localblock = PromptMapGenBlock(prompt_len=self.prompt_num, in_ch=out_size, prompt_dim=out_size, stride=stride_promptweight)
         
 
-    def forward(self, x, enc=None, dec=None, mask=None, event_filter=None, merge_before_downsample=True):
+    def forward(self, x, edge=None, prompt_weight_map=None, enc=None, dec=None, mask=None, event_filter=None, merge_before_downsample=True):
         out = self.conv_1(x)
 
         out_conv1 = self.relu_1(out)
@@ -202,12 +316,16 @@ class UNetConvBlock(nn.Module):
             
         if event_filter is not None and merge_before_downsample:
             # b, c, h, w = out.shape
-            out = self.image_event_transformer(out, event_filter) 
+            out_edge = self.conv_edge(edge)
+            prompt_local = self.prompt_localblock(prompt_weight_map)
+            out = self.image_event_transformer(self.conv1d(torch.cat([out, out_edge], 1)), event_filter, prompt_local) 
              
         if self.downsample:
             out_down = self.downsample(out)
             if not merge_before_downsample: 
-                out_down = self.image_event_transformer(out_down, event_filter) 
+                out_edge_down = self.downsample_edge(out_edge)
+                out_prompt_down = self.downsample_prompt(prompt_local)
+                out_down = self.image_event_transformer(self.conv1d(torch.cat([out_down,out_edge_down],1)), event_filter, out_prompt_down) 
 
             return out_down, out
 
@@ -215,7 +333,7 @@ class UNetConvBlock(nn.Module):
             if merge_before_downsample:
                 return out
             else:
-                out = self.image_event_transformer(out, event_filter)
+                out = self.image_event_transformer(self.conv1d(torch.cat([out,out_edge], 1)), event_filter, prompt_local)
 
 
 class UNetEVConvBlock(nn.Module):

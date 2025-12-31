@@ -10,3 +10,4 @@ __pycache__/
 basicsr.egg-info/
 experiments/
 tb_logger/
+prompt6_softmax_vis.ipynb

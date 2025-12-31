@@ -1,5 +1,5 @@
 # general settings
-name: EFNet_experiment_prompt_local_and_global_alllayers_parallelconvblock # add 'debug' for quick debug
+name: EFNet_experiment_4batch_LGprompt6_bottleneckonly_voxelinput_resnet18_concat_softmax # add 'debug' for quick debug
 model_type: ImageEventRestorationModel
 scale: 1
 num_gpu:  1 #4
@@ -35,6 +35,7 @@ datasets:
     dataset_enlarge_ratio: 4  # accelarate, equals to the num_gpu
     prefetch_mode: cpu
     num_prefetch_queue: 2
+    # pin_memory: true
 
   val:
     name: gopro-h5-test

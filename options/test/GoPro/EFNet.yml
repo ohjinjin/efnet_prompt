@@ -1,5 +1,5 @@
 # general settings
-name: EFNet_experiment_prompt_alllayers_test
+name: EFNet_experiment_4batch_prompt6_alllayers_featuremotioninput_resnet_concat_softmax_vis_test
 model_type: TestImageEventRestorationModel
 scale: 1
 num_gpu: 1 # set num_gpu: 0 for cpu mode
@@ -37,7 +37,7 @@ network_g:
 
 # path
 path:
-  pretrain_network_g: ./experiments/EFNet_experiment_prompt_alllayers/models/net_g_latest.pth
+  pretrain_network_g: ./experiments/EFNet_experiment_4batch_LGprompt6_alllayers_featuremotioninput_resnet18_concat_softmax/models/net_g_latest.pth
   strict_load_g: true
   resume_state: ~
   root: ./experiments/EFNet_inference/  # set this option ONLY in TEST!!!
@@ -48,6 +48,16 @@ val:
   grids: ~
   crop_size: ~
   rgb2bgr: false # to my h5 data, its false
+  metrics:
+    psnr:
+      type: calculate_psnr
+      crop_border: 0
+      test_y_channel: false
+    
+    ssim:
+      type: calculate_ssim
+      crop_border: 0
+      test_y_channel: false   
 
 # dist training settings
 dist_params:

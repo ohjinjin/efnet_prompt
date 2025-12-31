@@ -90,7 +90,7 @@ class PixelwisePromptDist(nn.Module):
 class EFNet(nn.Module):
     def __init__(self, in_chn=3, ev_chn=6, wf=64, depth=3, fuse_before_downsample=True, relu_slope=0.2, num_heads=[1,2,4]):
         super(EFNet, self).__init__()
-        self.prompt_num=32
+        self.prompt_num=8
         self.prompt_weight = PixelwisePromptDist(in_channels=ev_chn+in_chn, prompt_num=self.prompt_num, relu_slope=relu_slope)
         
         self.depth = depth
@@ -136,29 +136,29 @@ class EFNet(nn.Module):
 
         # B, C, H, W = event.shape
         prompt_weight_map = self.prompt_weight(torch.cat([event, image], dim=1))
-        B, N, H, W = prompt_weight_map.shape
-#         print("CHEKKKKBBBBCCCCCCCCNNNNNHHHHWWWWWWWW::",prompt_weights.shape)
-#         print("CHEKKKKBBBBCCCCCCCCNNNNNHHHHWWWWWWWW::",prompt_weights[0,:,0].shape)
+#         B, N, H, W = prompt_weight_map.shape
+# #         print("CHEKKKKBBBBCCCCCCCCNNNNNHHHHWWWWWWWW::",prompt_weights.shape)
+# #         print("CHEKKKKBBBBCCCCCCCCNNNNNHHHHWWWWWWWW::",prompt_weights[0,:,0].shape)
 
-        counter = 0
-        # 디렉토리가 존재하는 경우 연번호 추가
-        while os.path.exists(f"/home/work/data/code/EFNet_original/EFNet/experiments/result_weight_nhwc_dilation/{counter}"):
-#             dir_path = os.path.join(base_path, f"{each_batch}_{counter}")
-            counter += 1
+#         counter = 0
+#         # 디렉토리가 존재하는 경우 연번호 추가
+#         while os.path.exists(f"/home/work/data/code/EFNet_original/EFNet/experiments/result_weight_nhwc_dilation/{counter}"):
+# #             dir_path = os.path.join(base_path, f"{each_batch}_{counter}")
+#             counter += 1
             
-        # 각 배치에 대해 이미지로 저장
-        for each_batch in range(B):
-            # 폴더 생성
-            os.makedirs(f"/home/work/data/code/EFNet_original/EFNet/experiments/result_weight_nhwc_dilation/{counter}/{each_batch}/", exist_ok=True)
-            print(f"WEIGHTMAP::: /home/work/data/code/EFNet_original/EFNet/experiments/result_weight_nhwc_dilation/{counter}/{each_batch}/")
-            # 텐서를 PIL 이미지로 변환
-            imgs = prompt_weight_map[each_batch].cpu().numpy()  # (N, H, W)
-            for _ in range(N):
-                img = imgs[_]
-#                 print("CHECKJJINJIN:::::::", img.shape)
-                img = (img * 255).astype('uint8')  # 그레이스케일 값 범위를 0-255로 조정
-                img = Image.fromarray(img)
-                img.save(f"/home/work/data/code/EFNet_original/EFNet/experiments/result_weight_nhwc_dilation/{counter}/{each_batch}/prompt_weight_{_}.png")
+#         # 각 배치에 대해 이미지로 저장
+#         for each_batch in range(B):
+#             # 폴더 생성
+#             os.makedirs(f"/home/work/data/code/EFNet_original/EFNet/experiments/result_weight_nhwc_dilation/{counter}/{each_batch}/", exist_ok=True)
+#             print(f"WEIGHTMAP::: /home/work/data/code/EFNet_original/EFNet/experiments/result_weight_nhwc_dilation/{counter}/{each_batch}/")
+#             # 텐서를 PIL 이미지로 변환
+#             imgs = prompt_weight_map[each_batch].cpu().numpy()  # (N, H, W)
+#             for _ in range(N):
+#                 img = imgs[_]
+# #                 print("CHECKJJINJIN:::::::", img.shape)
+#                 img = (img * 255).astype('uint8')  # 그레이스케일 값 범위를 0-255로 조정
+#                 img = Image.fromarray(img)
+#                 img.save(f"/home/work/data/code/EFNet_original/EFNet/experiments/result_weight_nhwc_dilation/{counter}/{each_batch}/prompt_weight_{_}.png")
 
         ev = []
         #EVencoder
